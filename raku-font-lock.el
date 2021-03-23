@@ -154,7 +154,7 @@
         (declare
          . ,(rx (or "macro" "sub" "submethod" "method" "category"
                     "module" "class" "role" "package" "enum" "grammar"
-                    "slang" "subset")))
+                    "slang" "subset" "unit")))
         (rule . ,(rx (or "regex" "rule" "token")))
         (include . ,(rx (or "use" "require unit")))
         (conditional . ,(rx (or "if" "else" "elsif" "unless" "with"
