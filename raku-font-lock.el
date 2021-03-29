@@ -150,11 +150,11 @@
                        (0+ (regex "[^\[\{\('\",:[:space:]]"))
                        (or "«" "<<")))))
         (pre-declare
-         . ,(rx (or "multi" "proto" "only")))
+         . ,(rx (or "multi" "proto" "only" "unit")))
         (declare
          . ,(rx (or "macro" "sub" "submethod" "method" "category"
                     "module" "class" "role" "package" "enum" "grammar"
-                    "slang" "subset" "unit")))
+                    "slang" "subset")))
         (rule . ,(rx (or "regex" "rule" "token")))
         (include . ,(rx (or "use" "require unit")))
         (conditional . ,(rx (or "if" "else" "elsif" "unless" "with"
