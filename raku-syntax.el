@@ -62,264 +62,423 @@
     ("\x2E26" . "\x2E27") ("\x2329" . "\x232A"))
   "Exhaustive selection of brackets a/o 2021-04.")
 
-(defvar raku--rx-forms
-  (let ((rx-identifier
-         (rx-to-string `(and (regex "[_[:alpha:]]")
-                             (0+ (regex "[_[:alnum:]]"))
-                             (0+ (any "-'") (regex "[_[:alpha:]]") (0+ (regex "[_[:alnum:]]"))))))
-        (rx-metaoperator
-         (rx-to-string `(or (and (regex "[^[:digit:]@%$]")
-                                 (0+ (regex "[^\[\{\('\"[:space:]]")))
-                            (and (any "@%$")
-                                 (regex "[^.?^=_[:alpha:]]\[\{\('\"[:space:]]")
-                                 (0+ (regex "[^\[\{\('\"[:space:]]")))))))
-    ;; rx forms for raku
-    ;; these are organized into groups corresponding to their
-    ;; function (at least as it makes sense to me)
-    `((symbol (form)
-              `(and symbol-start ,@(cdr form) symbol-end))
-      ;; normal identifier, for things such as variables, subs, etc..
-      (identifier ,rx-identifier)
-      ;; whitespace stuff
-      (ws* ,(rx (0+ (any whitespace))))
-      (ws+ ,(rx (1+ (any whitespace))))
-      (unspace ,(rx "\\" (1+ (any whitespace))))
-      (unspace? ,(rx (? "\\" (1+ (any whitespace)))))
-      ;; POD6 stuff
-      ;; POD6 block directives (how we will read in the block)
-      (pod6-directive
-       ,(rx (or "for" "para" "begin")))
-      (pod6-type
-       ,(rx (or (seq (or "head" "item") (1+ (any digit))) ;; special case: headN, itemN
-                (seq (any upper) (1+ (any upper digit))) ; special case: Semantic blocks
-                "code" "input" "output" "item" "defn" "table" "comment")))
-      (pod6-formatcode
-       ,(rx (any "BCEIKLNPRTUVXZ")))
-      ;; keywords that imply inclusion of code units
-      (include ,(rx (or "use" "require unit")))
-      ;; declarator keywords
-      ;; things that come before declare
-      (pre-declare
-       ,(rx (or "multi" "proto" "only")))
-      ;; common declarators, plus any custom common declarators
-      (declare
-       ,(rx (or "macro" "sub" "submethod" "method" "category"
-                "module" "class" "role" "package" "enum" "grammar"
-                "slang" "subset")))
-      ;; regex declarators, ofen used inside grammars
-      (rule ,(rx (or "regex" "rule" "token")))
-      ;; keywords that indicate declaration scope
-      (scope ,(rx (or "let" "my" "our" "state" "temp" "has" "constant")))
-      ;; type constraints
-      (type-constraint
-       ,(rx (or "does" "as" "but" "trusts" "of" "returns" "handles" "where"
-                "augment" "supersede")))
-      ;; type properties
-      (type-property
-       ,(rx (or "signature" "context" "also" "shape" "prec" "irs" "ofs" "ors"
-                "export" "deep" "binary" "unary" "reparsed" "rw" "parsed"
-                "cached" "readonly" "defequiv" "will" "ref" "copy" "inline"
-                "tighter" "looser" "equiv" "assoc" "required")))
+;; Really complex rx workings, we need lots of rx
 
-      ;; flow control keywords
-      ;; for conditional expressions
-      (conditional ,(rx (or "if" "else" "elsif" "unless" "with"
-                            "orwith" "without")))
-      ;; for looping constructs
-      (loop ,(rx (or "for" "loop" "repeat" "while" "until" "gather" "given")))
-      ;; for other flow control constructs
-      (flow-control
-       ,(rx (or "take" "do" "when" "next" "last" "redo" "return" "contend"
-                "maybe" "defer" "start" "default" "exit" "make" "continue"
-                "break" "goto" "leave" "async" "lift")))
-      ;; for exceptions
-      (exception ,(rx (or "die" "fail" "try" "warn")))
+(defvar raku--rx-forms-alist ()
+  "Alist of custom rx constructs used in raku-mode.")
 
-      ;; "lower-level" constructs (as if such a thing could exist in raku)
-      ;; https://docs.raku.org/language/phasers
-      ;; phasers allow hooking program lifecycle events
-      (phaser
-       ,(rx (or "BEGIN" "CHECK" "INIT" "END"
-                "DOC BEGIN" "DOC CHECK" "DOC INIT"
-                "ENTER" "LEAVE" "KEEP" "UNDO"
-                "FIRST" "NEXT" "LAST"
-                "PRE" "POST"
-                "CATCH" "CONTROL"
-                "LAST" "QUIT"
-                "COMPOSE" "CLOSE")))
-      ;; https://docs.raku.org/language/pragmas
-      ;; this list appears to be things that go after use/no
-      (pragma ,(rx (or "v6" "v6.c" "v6.d" "v6.d.PREVIEW"
-                       "MONKEY-GUTS" "MONKEY-SEE-NO-EVAL" "MONKEY-TYPING" "MONKEY"
-                       "dynamic-scope" "experimental" "fatal" "internals" "invocant"
-                       "isms" "lib" "newline" "nqp" "parameters" "precompilation"
-                       "soft" "strict" "trace" "variables" "worries")))
+(defmacro raku--defrx (name docstring &rest regexps)
+  "Define both an rx constituent and compiled expression string.
+NAME is used to derive the string variable name, e.g.
+raku--(name)-rx. NAME is also used to define an rx construct that
+is available to defrx. FORM is an rx form that is evaluated with
+all previously defined constructs available.
+DOCSTRING is passed to defvar"
+  (declare (indent 1))
+  ;; lots of this is stolen from rx.el's internals. why, you might
+  ;; ask? well, `rx' is a bad macro and it doesn't work the way i want
+  ;; it to. or i'm a bad lisp hacker and don't work the way `rx' wants
+  ;; me to.
+  (let* ((rx--local-definitions raku--rx-forms-alist)
+         (seq-form (cons 'seq regexps))
+         (expr (rx--to-expr seq-form)))
+    (progn
+      ;; overrwrite anything that had this name before us
+      (setq raku--rx-forms-alist
+            (append
+             (assq-delete-all name raku--rx-forms-alist)
+             (list (list name seq-form))))
+      ;; define a var we can use elsewhere, with the compiled expression
+      `(defvar ,(intern (concat "raku--" (symbol-name name) "-rx"))
+         ,expr
+         ,docstring))))
 
-      ;; operators
-      ;; "wordy" operators
-      ;; TODO allow custom
-      (operator-word
-       ,(rx (or "div" "xx" "x" "mod" "also" "leg" "cmp" "before" "after" "eq"
-                "ne" "le" "lt" "not" "gt" "ge" "eqv" "ff" "fff" "and" "andthen"
-                "or" "xor" "orelse" "extra" "lcm" "gcd" "o")))
-      ;; single-char operators
-      ;; TODO allow custom
-      (operator-char ,(rx (any "-:+/*~?|=^!%&,<>».;\\∈∉∋∌∩∪≼≽⊂⊃⊄⊅⊆⊇⊈⊉⊍⊎⊖∅∘")))
-      ;; reduce operator - really not sure what this is or where it's
-      ;; documented. if it is documented, it's under a different
-      ;; name.
-      (reduce-operator
-       ,(rx-to-string
-         `(and (0+ (any "RSXZ\["))
-               (opt (any "RSXZ&"))
-               (1+ "\[")
-               (opt "\(")
-               (regex ,rx-metaoperator)
-               (opt "\)")
-               (1+ "\]"))))
-      ;; more spooky ops
-      (rsxz-operator
-       ,(rx
-         symbol-start
-         (any "RSXZ")
-         (or (or (and (or "div" "mod" "gcd" "lcm" "xx" "x" "does" "but" "cmp"
-                          "leg" "eq" "ne" "gt" "ge" "lt" "le" "before" "after"
-                          "eqv" "min" "max" "not" "so" "andthen" "and" "or"
-                          "orelse")
-                      symbol-end)
-                 (any ".,")
-                 (1+ (regex "[^:\[.,[:space:][:alnum:]]")))
-             symbol-end)))
-      ;; hyper operator - map over a list
-      (hyper-operator
-       ,(rx-to-string
-         `(or (and "«" (regex ,rx-metaoperator) (char "«»"))
-              (and "»" (regex ,rx-metaoperator) (opt (char "«»")))
-              (and "<<" (regex ,rx-metaoperator) (or "<<" ">>"))
-              (and ">>" (regex ,rx-metaoperator) (opt (or "<<" ">>")))
-              (and (regex "[^[:digit:]\[\{\('\",:[:space:]]")
-                   (0+ (regex "[^\[\{\('\",:[:space:]]"))
-                   (or "«" "<<")))))
-      ;; operations on sets
-      (set-operator
-       ,(rx (opt "R")
-            "\("
-            (or (char "-^.+|&")
-                (and (char "<>") (opt (char "=+")))
-                "cont"
-                "elem")
-            "\)"))
+;; Rx rules
 
-      ;; types
-      ;; low-level (virtual machine) types, seen in nqp and when
-      ;; using NativeCall
-      (low-type
-       ,(rx (or "int" "int1" "int2" "int4" "int8" "int16" "int32" "int64"
-                "rat" "rat1" "rat2" "rat4" "rat8" "rat16" "rat32" "rat64"
-                "buf" "buf1" "buf2" "buf4" "buf8" "buf16" "buf32" "buf64"
-                "uint" "uint1" "uint2" "uint4" "uint8" "uint16" "uint32"
-                "uint64" "utf8" "utf16" "utf32" "bit" "bool" "bag" "set"
-                "mix" "num" "complex")))
-      ;; language-level types considered to be significant
-      ;; TODO: allow custom
-      (high-type
-       ,(rx (or "Object" "Any" "Junction" "Whatever" "Capture" "Match"
-                "Signature" "Proxy" "Matcher" "Package" "Module" "Class"
-                "Grammar" "Scalar" "Array" "Hash" "KeyHash" "KeySet" "KeyBag"
-                "Pair" "List" "Seq" "Range" "Set" "Bag" "BagHash" "Mapping" "Void"
-                "Undef" "Failure" "Exception" "Code" "Block" "Routine" "Sub"
-                "Macro" "Method" "Submethod" "Regex" "Str" "Blob" "Char" "Map"
-                "Byte" "Parcel" "Codepoint" "Grapheme" "StrPos" "StrLen"
-                "Version" "Num" "Complex" "Bit" "True" "False" "Order" "Same"
-                "Less" "More" "Increasing" "Decreasing" "Ordered" "Callable"
-                "AnyChar" "Positional" "Associative" "Ordering" "KeyExtractor"
-                "Comparator" "OrderingPair" "IO" "KitchenSink" "Role" "Int" "Bool"
-                "Rat" "Buf" "UInt" "Abstraction" "Numeric" "Real" "Nil" "Mu")))
+;; * Base Rules
 
-      ;; ordinals
-      ;; version number (e.g. v6.0)
-      (version ,(rx "v" (1+ digit) (0+ "." (or "*" (1+ digit))) (opt "+")))
-      ;; base-10 number
-      (number
-       ,(rx
-         (group-n 1
-                  (or (and (1+ digit)
-                           (0+ (and "_" (1+ digit)))
-                           (opt "."
-                                (1+ digit)
-                                (0+ (and "_" (1+ digit)))))
-                      (and "."
-                           (1+ digit)
-                           (0+ (and "_" (1+ digit))))))
-         (opt (group-n 2 (any "Ee"))
-              (group-n 3 (opt "-") (1+ digit) (0+ "_" (1+ digit))))
-         (opt (group-n 4 "i"))))
-      ;; base-n number - group 1 is the leading 0, 2 the base
-      ;; indicator, 3 the number.
-      (base-number
-       ,(rx symbol-start
-            (group-n 1 "0")
-            (or (and
-                 (group-n 2 "o")
-                 (group-n 3 (any "0-7") (0+ (any "0-7_"))))
-                (and
-                 (group-n 2 "b")
-                 (group-n 3 (any "0-1") (0+ (any "0-1_"))))
-                (and
-                 (group-n 2 "x")
-                 (group-n 3 (regex "[[:xdigit:]]") (0+ (regex "[[:xdigit:]_]"))))
-                (and
-                 (group-n 2 "d")
-                 (group-n 3 (regex "[[:digit:]]") (0+ (regex "[[:digit:]_]"))))))))))
+(raku--defrx identifier
+  "Raku identifier regexp."
+  (and (regex "[_[:alpha:]]")
+       (0+ (regex "[_[:alnum:]]"))
+       (0+ (any "-'") (regex "[_[:alpha:]]") (0+ (regex "[_[:alnum:]]")))))
 
-(rx-let-eval raku--rx-forms
-  (defconst raku--comment-rx
-    ;; comments in raku have the following form:
-    ;;   #12
-    ;; where 1 might be some sort of twigil (`, =, |),
-    ;; where 2 might be an opener for a multiline comment
-    ;; if 1 is `
-    ;;   then expect either whitespace or a opener immediately
-    ;;   after. if any other character occurs, this is invalid
-    ;;   syntax.
-    ;; if 1 is = or |
-    ;;   then allow an opener, or a character immediately after.
-    ;;   if the character immediately after is an opener, this
-    ;;   is a multi-line comment.
-    ;;
-    ;; we should propertize everything from the # to the end
-    ;; as comment text, and as syntax-multiline
-    (rx-to-string '(seq "#"
-                        (? (group-n 1 (any "|=`")))
-                        (? (group-n 2 (syntax ?\())))))
-  (defconst raku--pod-rx
-    ;; Anatomy of a POD directive
-    ;;
-    ;; =para head1 :k(v)
-    ;;  ---^ ----^ ----^
-    ;;  Dir. Type. Params.
-    ;;
-    ;; Dir. - An optional directive (see pod6-directive)
-    ;; These directives give hints to the parser about
-    ;; where the POD directive ends.
-    ;;
-    ;; Type - A mandatory type (see pod6-type)
-    ;; This is mandatory. When a directive is not specified,
-    ;; the type must be directly adjacent to the leading '=',
-    ;; (e.g. =head1). If a directive is not specified, it is
-    ;; assumed to be `para`.
-    ;;
-    ;; Params - Optional parameters for the typesetting
-    ;; system.
-    (rx-to-string '(seq line-start ws* "="
-                        (? (group-n 1 pod6-directive) ws+) ;; optional block directive, assume para
-                        (group-n 2 pod6-type)))) ;; block type, TODO maybe include label in expr?
-  (defconst raku--pod-end-nondelim-rx
-    (rx-to-string `(or
-                    (seq line-start ws* line-end)
-                    (regex ,raku--pod-rx))))
-  (defconst raku--pod-format-rx
-    (rx-to-string '(seq (group-n 1 pod6-formatcode) "<")))
+(raku--defrx metaoperator
+  "Raku meta-operator regexp."
+  (or (and (regex "[^[:digit:]@%$]")
+           (0+ (regex "[^\[\{\('\"[:space:]]")))
+      (and (any "@%$")
+           (regex "[^.?^=_[:alpha:]]\[\{\('\"[:space:]]")
+           (0+ (regex "[^\[\{\('\"[:space:]]")))))
+
+(raku--defrx ws*
+  "Eat some or no whitespace."
+  (0+ (any whitespace)))
+
+(raku--defrx ws+
+  "Eat a minimum of one whitespace."
+  (1+ (any whitespace)))
+
+(raku--defrx unspace
+  "Match expected unspace."
+  "\\" ws+)
+
+(raku--defrx unspace?
+  "Match optional unspace."
+  (? unspace))
+
+;; * POD6/Comment Rules
+
+(raku--defrx pod6-directive-term
+  "Match POD6 directive terms."
+  (or "for" "para" "begin"))
+
+(raku--defrx pod6-type
+  "Match POD6 type terms."
+  (or (seq (or "head" "item") (1+ (any digit))) ;; special case: headN, itemN
+      (seq (any upper) (1+ (any upper digit))) ;; special case: Semantic blocks
+      "code" "input" "output" "item" "defn" "table" "comment"))
+
+(raku--defrx pod6-format-char
+  "Match POD6 format code types."
+  (any "BCEIKLNPRTUVXZ"))
+
+(raku--defrx pod6-directive
+  "Match a POD6 directive.
+For delimited blocks, this matches the opening directive."
+  ;; Anatomy of a POD directive
+  ;;
+  ;; =para head1 :k(v)
+  ;;  ---^ ----^ ----^
+  ;;  Dir. Type. Params.
+  ;;
+  ;; Dir. - An optional directive (see pod6-directive)
+  ;; These directives give hints to the parser about
+  ;; where the POD directive ends.
+  ;;
+  ;; Type - A mandatory type (see pod6-type)
+  ;; This is mandatory. When a directive is not specified,
+  ;; the type must be directly adjacent to the leading '=',
+  ;; (e.g. =head1). If a directive is not specified, it is
+  ;; assumed to be `para`.
+  ;;
+  ;; Params - Optional parameters for the typesetting
+  ;; system.
+  line-start ws* "="
+  (? (group-n 1 pod6-directive-term) ws+) ;; optional block directive, assume para
+  (group-n 2 pod6-type)) ;; block type, TODO maybe include label in expr?
+
+(raku--defrx pod6-end-para
+  "Ending of a non-delimited, non-abbreviated POD6 line."
+  (or
+   ;; terminates on a blank line
+   (seq line-start ws* line-end)
+   ;; or the next POD directive
+   pod6-directive))
+
+(raku--defrx pod6-format-sequence
+  "POD6 formatting sequence opener."
+  (group-n 1 pod6-format-char) "<")
+
+(raku--defrx comment
+  "Match opening portion of comment."
+  ;; comments in raku have the following form:
+  ;;   #12
+  ;; where 1 might be some sort of twigil (`, =, |),
+  ;; where 2 might be an opener for a multiline comment
+  ;; if 1 is `
+  ;;   then expect either whitespace or a opener immediately
+  ;;   after. if any other character occurs, this is invalid
+  ;;   syntax.
+  ;; if 1 is = or |
+  ;;   then allow an opener, or a character immediately after.
+  ;;   if the character immediately after is an opener, this
+  ;;   is a multi-line comment.
+  ;;
+  ;; we should propertize everything from the # to the end
+  ;; as comment text, and as syntax-multiline
+  "#"
+  (? (group-n 1 (any "|=`")))
+  (? (group-n 2 (syntax ?\())))
+
+;; * Runtime Workings
+
+(raku--defrx import
+  "Match terms that 'import' other code, such as require."
+  (or "use" "require unit"))
+
+(raku--defrx pragma
+  "Match pragma terms."
+  (or "v6" "v6.c" "v6.d" "v6.d.PREVIEW" ;; todo could probably use version literal
+      "MONKEY-GUTS" "MONKEY-SEE-NO-EVAL" "MONKEY-TYPING" "MONKEY"
+      "dynamic-scope" "experimental" "fatal" "internals" "invocant"
+      "isms" "lib" "newline" "nqp" "parameters" "precompilation"
+      "soft" "strict" "trace" "variables" "worries"))
+
+;; * Structure and Declarator Rules
+
+(raku--defrx pre-declare
+  "Match terms that modify declarations."
+  (or "multi" "proto" "only"))
+
+(raku--defrx declare
+  "Match general declarators."
+  (or "macro" "sub" "submethod" "method" "category"
+      "module" "class" "role" "package" "enum" "grammar"
+      "slang" "subset"))
+
+(raku--defrx rule
+  "Matches regexp declarators."
+  (or "regex" "rule" "token"))
+
+(raku--defrx scope
+  "Match scope modifiers."
+  (or "let" "my" "our" "state" "temp" "has" "constant"))
+
+(raku--defrx type-constraint
+  "Match type constraints."
+  (or "does" "as" "but" "trusts" "of" "returns" "handles" "where"
+      "augment" "supersede"))
+
+(raku--defrx type-property
+  "Match type properties."
+  (or "signature" "context" "also" "shape" "prec" "irs" "ofs" "ors"
+      "export" "deep" "binary" "unary" "reparsed" "rw" "parsed"
+      "cached" "readonly" "defequiv" "will" "ref" "copy" "inline"
+      "tighter" "looser" "equiv" "assoc" "required"))
+
+;; * Flow Control and Lifecycle Rules
+
+(raku--defrx conditional
+  "Match conditional terms."
+  (or "if" "else" "elsif" "unless" "with"
+      "orwith" "without" "given"))
+
+(raku--defrx loop
+  "Match loop terms."
+  (or "for" "loop" "repeat" "while" "until" "gather"))
+
+(raku--defrx flow-control
+  "Match other flow-control terms."
+  (or "take" "do" "when" "next" "last" "redo" "return" "contend"
+      "maybe" "defer" "start" "default" "exit" "make" "continue"
+      "break" "goto" "leave" "async" "lift"))
+
+(raku--defrx exception
+  "Match exception-raising terms."
+  (or "die" "fail" "try" "warn"))
+
+(raku--defrx phaser
+  "Match lifecycle subroutines (phasers)."
+  (or "BEGIN" "CHECK" "INIT" "END"
+      "DOC BEGIN" "DOC CHECK" "DOC INIT"
+      "ENTER" "LEAVE" "KEEP" "UNDO"
+      "FIRST" "NEXT" "LAST"
+      "PRE" "POST"
+      "CATCH" "CONTROL"
+      "LAST" "QUIT"
+      "COMPOSE" "CLOSE"))
+
+;; * Default operators and other provided constructs of interest
+
+(raku--defrx operator-word
+  "Wordy operators."
+  (or "div" "xx" "x" "mod" "also" "leg" "cmp" "before" "after" "eq"
+      "ne" "le" "lt" "not" "gt" "ge" "eqv" "ff" "fff" "and" "andthen"
+      "or" "xor" "orelse" "extra" "lcm" "gcd" "o"))
+
+(raku--defrx operator-symbol
+  "Symbolic operators."
+  (any "-:+/*~?|=^!%&,<>».;\\∈∉∋∌∩∪≼≽⊂⊃⊄⊅⊆⊇⊈⊉⊍⊎⊖∅∘"))
+
+(raku--defrx operator-reduce
+  "Reducing operator."
+  (and (0+ (any "RSXZ\["))
+       (opt (any "RSXZ&"))
+       (1+ "\[")
+       (opt "\(")
+       metaoperator
+       (opt "\)")
+       (1+ "\]")))
+
+(raku--defrx operator-rsxz
+  "I don't know and I can't find documentation."
+  symbol-start
+  (any "RSXZ")
+  (or
+   (or
+    ;; maybe need to use `operator'?
+    (and operator-word symbol-end)
+    (any ".,")
+    (1+ (regex "[^:\[.,[:space:][:alnum:]]"))) ;; ^identifier?
+   symbol-end))
+
+(raku--defrx operator-hyper
+  "Hyper (mapping) operators."
+  (or (and "«" metaoperator (char "«»"))
+      (and "»" metaoperator (opt (char "«»")))
+      (and "<<" metaoperator (or "<<" ">>"))
+      (and ">>" metaoperator (opt (or "<<" ">>")))
+      (and (regex "[^[:digit:]\[\{\('\",:[:space:]]")
+           (0+ (regex "[^\[\{\('\",:[:space:]]"))
+           (or "«" "<<"))))
+
+(raku--defrx operator-set
+  "Another mystery."
+  (opt "R")
+  "("
+  (or (char "-^.+|&")
+      (and (char "<>") (opt (char "=+")))
+      "cont"
+      "elem")
+  ")")
+
+(raku--defrx operator
+  "Any operator."
+  (or operator-word operator-symbol
+      operator-reduce operator-rsxz
+      operator-hyper operator-set))
+
+;; * Core types
+
+(raku--defrx type-low
+  "Low-level core types."
+  (or "int" "int1" "int2" "int4" "int8" "int16" "int32" "int64"
+      "rat" "rat1" "rat2" "rat4" "rat8" "rat16" "rat32" "rat64"
+      "buf" "buf1" "buf2" "buf4" "buf8" "buf16" "buf32" "buf64"
+      "uint" "uint1" "uint2" "uint4" "uint8" "uint16" "uint32"
+      "uint64" "utf8" "utf16" "utf32" "bit" "bool" "bag" "set"
+      "mix" "num" "complex"))
+
+(raku--defrx type-high
+  "High-level core types."
+  (or "Object" "Any" "Junction" "Whatever" "Capture" "Match"
+      "Signature" "Proxy" "Matcher" "Package" "Module" "Class"
+      "Grammar" "Scalar" "Array" "Hash" "KeyHash" "KeySet" "KeyBag"
+      "Pair" "List" "Seq" "Range" "Set" "Bag" "BagHash" "Mapping" "Void"
+      "Undef" "Failure" "Exception" "Code" "Block" "Routine" "Sub"
+      "Macro" "Method" "Submethod" "Regex" "Str" "Blob" "Char" "Map"
+      "Byte" "Parcel" "Codepoint" "Grapheme" "StrPos" "StrLen"
+      "Version" "Num" "Complex" "Bit" "True" "False" "Order" "Same"
+      "Less" "More" "Increasing" "Decreasing" "Ordered" "Callable"
+      "AnyChar" "Positional" "Associative" "Ordering" "KeyExtractor"
+      "Comparator" "OrderingPair" "IO" "KitchenSink" "Role" "Int" "Bool"
+      "Rat" "Buf" "UInt" "Abstraction" "Numeric" "Real" "Nil" "Mu"))
+
+(raku--defrx type
+  "Any core type."
+  (or type-low type-high))
+
+;; * Literals
+
+(raku--defrx literal-version
+  "Version literal, e.g. ~v1.2.3~."
+  "v" (1+ digit) (0+ "." (or "*" (1+ digit))) (opt "+"))
+
+(raku--defrx literal-number
+  "Base-10 number literal."
+  (group-n 1
+           (or (and (1+ digit)
+                    (0+ (and "_" (1+ digit)))
+                    (opt "."
+                         (1+ digit)
+                         (0+ (and "_" (1+ digit)))))
+               (and "."
+                    (1+ digit)
+                    (0+ (and "_" (1+ digit))))))
+  (opt (group-n 2 (any "Ee"))
+       (group-n 3 (opt "-") (1+ digit) (0+ "_" (1+ digit))))
+  (opt (group-n 4 "i")))
+
+(raku--defrx literal-base-number
+  "Base-N number literal."
+  symbol-start
+  (group-n 1 "0")
+  (or (and
+       (group-n 2 "o")
+       (group-n 3 (any "0-7") (0+ (any "0-7_"))))
+      (and
+       (group-n 2 "b")
+       (group-n 3 (any "0-1") (0+ (any "0-1_"))))
+      (and
+       (group-n 2 "x")
+       (group-n 3 (regex "[[:xdigit:]]") (0+ (regex "[[:xdigit:]_]"))))
+      (and
+       (group-n 2 "d")
+       (group-n 3 (regex "[[:digit:]]") (0+ (regex "[[:digit:]_]"))))))
+
+;; * Literals: The dreaded Q-Lang
+
+;; These can be
+;; - delimited by balanced chars (syntax "()")
+;; - delimited by the same unbalanced char
+;; - delimited by ' or () only if space is placed between Q and ( or '
+
+(raku--defrx q-construct
+  "Different kinds of Q-construct."
+  ;; Q - literal string
+  ;; q - escaping
+  ;; qq - interpolated
+  ;; qw - word quoting (also: < >)
+  ;; qww - word quoting with quote protection
+  ;; qqw - word quoting with interpolation
+  ;; qqww - word quoting with interpolation and quote protection (also: << >>, « »)
+  (or "Q" "qw" "qww" "qq" "qqw" "q"
+      "qqww" "qx" "qqx"))
+
+(defvar raku--q-adverb-alist
+  `(("x"  . "exec")
+    ("w"  . "words")
+    ("ww" . "quotewords")
+    ("q"  . "single")
+    ("qq" . "double")
+    ("s"  . "scalar")
+    ("a"  . "array")
+    ("h"  . "hash")
+    ("c"  . "closure")
+    ("b"  . "backslash")
+    ("to" . "heredoc")
+    ("v"  . "val"))
+  "Alist associating short and long Q-adverb forms.")
+
+(defmacro raku--q-adverb-expand (adverb)
+  "Disambiguate a Q-adverb.
+Given an abbreviated ADVERB, this will return the corresponding
+long form according to `raku--q-adverb-alist'. If no long form is
+associated with ADVERB, then return ADVERB."
+  `(or (assq ,adverb raku--q-adverb-alist) adverb))
+
+(raku--defrx q-adverb
+  "Different Q-adverbs. May be chained.
+This is generated from `raku--q-adverb-alist', which associates
+adverbs with their abbreviations. If that alist is updated, the
+variable form of this rule ~raku-- ... -rx~ must be
+re-declared/updated in order to reflect the changes. Because the
+rx-construct form of this rule uses the exec construct, any `rx'
+use of the construct that is not part of a precompiled
+value (such as this variable) will reflect changes immediately;
+However, pre-compiled forms should be preferred where performance
+is desirable over flexibility."
+  ":" (eval (cons 'or (flatten-list raku--q-adverb-alist))))
+
+(raku--defrx q-expression
+  "Match the opening portion of a Q-lang expr.
+Q-lang is complicated and requires"
+  ;; start with a Q construct
+  (group-n 1 q-construct)
+  ;; permit unspace for tasteless people
+  unspace?
+  ;; next, adverbs
+  (0+ (group-n 2 q-adverb))
+  ;; then, if this is () or '-delimited, we need to expect a space. i
+  ;; won't yet bother with making the regexp smart enough to know that
+  ;; ' and () REQUIRE a space, just that it is appropriate in that case.
+  (or (seq ws+ (group-n 3 (any "'(")))
+      ;; any opener or punctuation
+      (seq unspace? (group-n 3 (not (syntax ?_))))))
+
+
+(rx-let-eval raku--rx-forms-alist
   (defconst raku--heredoc-rx
     ;; I'm assuming heredoc delims are restricted to syntax class _
     ;; also, heredocs are a special class of q-string it appears
@@ -370,7 +529,7 @@
 (defmacro raku-rx (&rest sexps)
   "Convert SEXPS to regexp with raku forms available.
 See `rx', `rx-let', and `rx-let-eval' for more details."
-  (let ((rx--local-definitions raku--rx-forms))
+  (let ((rx--local-definitions raku--rx-forms-alist))
     (rx--to-expr (cons 'seq sexps))))
 
 ;; end of rx stuff
@@ -400,77 +559,80 @@ See `rx', `rx-let', and `rx-let-eval' for more details."
        (match-end group)
        props))))
 
-(defun raku--find-matching-paren (limit &optional can-escape)
-  "From `point', search for balanced parens until LIMIT based on syntax table.
-This function will move `point' either to LIMIT, or to the
-position /after/ the final paren. `following-char' is used to
-determine which paren set will be scanned. If CAN-ESCAPE is
-non-nil, \\ will cause the parser to skip over one char."
-  ;; read opening char
-  (let* ((opener   (following-char))
-         (closer   (matching-paren opener))
-         (depth    1)
-         (found-at nil))
-    (when (or (zerop opener) (not closer))
-      (error "Call to raku--find-matching paren facing char %d which has no known closer" opener))
-    ;; pass first paren
-    (forward-char)
-    ;; read buffer and count balanced boundary chars
-    ;; once we hit CLOSE-CHAR at depth 0, set FOUND-AT
-    (while (and (< (point) limit) (> depth 0))
-      (cond
-       ;; extra advance if we encounter an escape, this way we
-       ;; don't analyze whatever comes after
-       ((and can-escape (raku--looking-at-char ?\\))
-        (forward-char))
-       ;; increase depth if we see an opener
-       ((raku--looking-at-char opener)
-        (setq depth (+ depth 1))
-        (forward-char))
-       ;; decrease depth if we see a closer
-       ((raku--looking-at-char closer)
-        (setq depth (- depth 1))
-        (when (zerop depth) (setq found-at (point)))
-        (forward-char)))
-      ;; skip past any non parens/punctuation (we may want to catch escapes)
-      (skip-syntax-forward "^.()" limit))
-    ;; back up if we leveled out
-    (when found-at (goto-char found-at))))
+;; Comments/POD/Markup
 
-(defun raku-syntax-propertize-comment (end)
+(defun raku-syntax-propertize-pod-text (limit)
+  "Propertize a region of text containing pod6 markup, bounded by LIMIT.
+Note that this function is aware of where pod text should stop,
+so you must set LIMIT wisely."
+  ;; TODO: could very efficiently mark non-control as some other face
+  ;; TODO: nested format code support
+  (while (< (point) limit)
+    ;; find the next occurence of *<...
+    (if (re-search-forward raku--pod-format-rx limit t)
+        ;; the above search such place us after the format leader, e.g. `B<|`
+        (let ((text-begin (point)))
+          ;; step back to the < opening the text
+          (goto-char (1- text-begin))
+          ;; tell forward-list (great name, I know) to skip to closer
+          (forward-list)
+          ;; forward-list will leave us after the closing >, e.g. `B<text>|` so,
+          ;; it would follow that (1- (point)) will be the end of text
+          (let* ((text-end (1- (point)))
+                 (code     (match-string 1))
+                 (face     (pcase code
+                             ("B" 'bold)
+                             ("I" 'italic)
+                             ("U" 'underline)
+                             ((or "L" "P") 'link)
+                             ("T" 'term)
+                             ("X" 'raku-label)
+                             ("Z" 'raku-comment)
+                             (_   'raku-string))))
+            (put-text-property text-begin text-end 'font-lock-face face)))
+      ;; no POD markup was found from (point) until LIMIT, so just skip all
+      ;; text.
+      (goto-char limit))))
+
+(defun raku-syntax-propertize-comment (_limit)
   "Propertize a raku comment.
 Should be called looking at the comment.
-`match-data' should be match data for `raku--comment-rx'.
-Will propertize until END or end of comment."
-  ;; bad hack to get match data to be consistent
-  ;; wil always be redundant when called from `raku-syntax-propertize'
-  ;; go to the end of the comment
+`match-data' should be match data for `raku--comment-rx'."
   (let ((begin    (match-beginning 0))  ;; begin match
         (twigil   (match-beginning 1))  ;; begin twigil match
         (boundary (match-beginning 2))) ;; begin boundary match
+    ;; go to the end of the comment
     (if boundary
         (progn
           ;; step to before boundary (e.g. |<...), and then search till matching
           ;; balanced paren found
           (goto-char boundary)
           (forward-list)
-          ;;(message "bounded text: %s" (buffer-substring-no-properties boundary (point)))
           ;; mark as a multiline construct so that
           ;; propertize-function gets called with correct chunk
           ;; boundaries (see `syntax-propertize-multiline')
           (put-text-property begin (point) 'syntax-multiline t))
       (end-of-line))
-    ;; propertize doc/embed twigil if it's here
-    (put-text-property twigil (1+ twigil) 'font-lock-face 'raku-twigil)
     ;; propertize the comment from beginning to point
-    (put-text-property begin (point) 'font-lock-face 'raku-comment)))
+    (put-text-property begin (point) 'font-lock-face 'raku-comment)
+    ;; propertize doc/embed twigil if it's here, also propertize POD
+    ;; markup, since = and | imply documentation text (see declarator comments)
+    (when twigil
+      (let ((end (point)))
+        (save-excursion
+          ;; go to pos after either twigil or boundary open
+          (goto-char (1+ (or boundary twigil)))
+          ;; and then propertize until either just before boundary close or end
+          ;; of comment
+          (raku-syntax-propertize-pod-text (if boundary (1- end) end))))
+      (put-text-property twigil (1+ twigil) 'font-lock-face 'raku-twigil))))
 
-;; POD6 Parsers
+;; POD6 Parser
 
 (defun raku--pod-find-end-delimited (type limit)
   "Search up to LIMIT for an end directive for pod6 TYPE.
 Return non-nil if found before LIMIT."
-  (rx-let-eval raku--rx-forms
+  (rx-let-eval raku--rx-forms-alist
       (let ((found  nil)
             (end-rx (rx-to-string `(seq ws* line-start "=end" ws+ ,type))))
         (while (and (< (point) limit) (not found))
@@ -498,49 +660,16 @@ Return non-nil if found before LIMIT."
          (t (forward-line))))
       found)))
 
-(defun raku-syntax-propertize-pod-text (limit)
-  "Propertize a region of text support pod6 control chars, bounded by LIMIT.
-Note that this function is aware of where pod text should stop,
-so you must set LIMIT wisely."
-  ;; TODO: nested format code support
-  (while (< (point) limit)
-    ;; find the next occurence of *<...
-    (when (re-search-forward raku--pod-format-rx limit t)
-      ;; the above search such place us after the format leader, e.g. `B<|`
-      (let ((text-begin (point)))
-        ;; step back to the < opening the text
-        (goto-char (1- text-begin))
-        ;; tell forward-list (great name, I know) to skip to closer
-        (forward-list)
-        ;; find-matching-paren will leave us after the closing >, e.g.
-        ;; `B<text>|` so, it would follow that (1- (point)) will be the end of
-        ;; text
-        (let* ((text-end (1- (point)))
-               (code     (match-string 1))
-               (face     (pcase code
-                           ("B" 'bold)
-                           ("I" 'italic)
-                           ("U" 'underline)
-                           ((or "L" "P") 'link)
-                           ("T" 'term)
-                           ("X" 'raku-label)
-                           ("Z" 'raku-comment)
-                           (_   'raku-string))))
-          (put-text-property text-begin text-end 'font-lock-face face))))))
-
-(defun raku-syntax-propertize-pod (match-data limit)
+(defun raku-syntax-propertize-pod (limit)
   "Propertize a region of plain old documentation until LIMIT.
-MATCH-DATA should contain integer match boundaries corresponding
-to `raku--pod-rx' as per `match-data'."
-  (let* ((begin     (nth 0 match-data))
-         (dir-beg   (nth 2 match-data))
-         (dir-end   (nth 3 match-data))
-         (directive (if dir-beg
-                        (buffer-substring dir-beg dir-end)
-                      nil))
-         (typ-beg   (nth 4 match-data))
-         (typ-end   (nth 5 match-data))
-         (type      (buffer-substring typ-beg typ-end))
+`match-data' must be populated appropriately for `raku--pod-rx'"
+  (let* ((begin     (match-beginning 0))
+         (dir-beg   (match-beginning 1))
+         (dir-end   (match-end       1))
+         (directive (match-string    1))
+         (typ-beg   (match-beginning 2))
+         (typ-end   (match-end       2))
+         (type      (match-string    2))
          (abbrev    (null directive))
          ;; search the end point and report it, also moves `point'
          ;; will be nil if POD does not terminate
@@ -589,29 +718,32 @@ Works by stepping through characters in the region until certain
 expressions are matched, at which point those expressions are
 propertized/fontified as appropriate."
   (goto-char chunk-begin)
-  (setq inhibit-redisplay nil)
   ;; analysis order:
   ;; 1. comments
   ;; 2. pod
-  (rx-let-eval raku--rx-forms
-    (while (< (point) chunk-end)
-      (let ((start (point)))
-        (cond
-         ;; comments, multiline comments, and documentation comments
-         ((looking-at raku--comment-rx)
-          ;; TODO - do we want to modify this so that we can font-lock the twigil?
-          (raku-syntax-propertize-comment chunk-end))
-         ;; POD, POD code blocks (yikes)
-         ((looking-at raku--pod-rx)
-          (raku-syntax-propertize-pod (match-data t) chunk-end))
-         ;; inf. loop guard
-         ((looking-at "\\S-") (forward-char))
-         (t
-          (let ((begin (point)))
-            (skip-syntax-forward " ")
-            (put-text-property begin (point) 'font-lock-face nil))))
-        ;;(message "%S" `(raku-syntax-propertize-post (chunk ,(buffer-substring-no-properties start (point)))))
-        ))))
+  (while (< (point) chunk-end)
+    (let ((start (point)))
+      (cond
+       ;; comments, multiline comments, and documentation comments
+       ((looking-at raku--comment-rx)
+        ;; TODO - do we want to modify this so that we can font-lock the twigil?
+        (raku-syntax-propertize-comment chunk-end))
+       ;; POD, POD code blocks (yikes)
+       ((looking-at raku--pod-rx)
+        (raku-syntax-propertize-pod chunk-end))
+       ;; Keywords - declare, pre-declare
+       ((looking-at (rx-to-string'(or declare pre-declare))))
+       ;; inf. loop guard
+       ((looking-at "\\S-")
+        (put-text-property (point) (1+ (point)) 'font-lock-face nil)
+        (forward-char))
+       (t
+        (let ((begin (point)))
+          (skip-syntax-forward " ")
+          ;; TODO: needed?
+          (put-text-property begin (point) 'font-lock-face nil))))
+      ;;(message "%S" `(raku-syntax-propertize-post (chunk ,(buffer-substring-no-properties start (point)))))
+      )))
 
 (provide 'raku-syntax)
 
