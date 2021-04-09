@@ -487,6 +487,20 @@ Q-lang is complicated and requires"
                         ":to/" (group-n 2 (syntax ?_)) "/"))))
 
 
+;; :upside-down-smiley:
+;;
+;; rx-let-eval sets up rx--local-definitions, but rx-let sticks them
+;; in macroexpand-all-environment and expects rx to then set
+;; rx--local-definitions from *that*. this makes zero sense to me.
+;; hack hack hack
+(defmacro raku-rx (&rest sexps)
+  "Convert SEXPS to regexp with raku forms available.
+See `rx', `rx-let', and `rx-let-eval' for more details."
+  (let ((rx--local-definitions raku--rx-forms-alist))
+    (rx--to-expr (cons 'seq sexps))))
+
+;; end of rx stuff
+
 ;; See [[info:elisp#Syntax Class Table]]
 (defvar raku-mode-syntax-table
   (let ((table (make-syntax-table)))
@@ -520,19 +534,6 @@ Q-lang is complicated and requires"
     table)
   "Top-level syntax table for raku-mode.")
 
-;; :upside-down-smiley:
-;;
-;; rx-let-eval sets up rx--local-definitions, but rx-let sticks them
-;; in macroexpand-all-environment and expects rx to then set
-;; rx--local-definitions from *that*. this makes zero sense to me.
-;; hack hack hack
-(defmacro raku-rx (&rest sexps)
-  "Convert SEXPS to regexp with raku forms available.
-See `rx', `rx-let', and `rx-let-eval' for more details."
-  (let ((rx--local-definitions raku--rx-forms-alist))
-    (rx--to-expr (cons 'seq sexps))))
-
-;; end of rx stuff
 
 ;; Propertizer/Lexer/Helper funs
 
