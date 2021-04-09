@@ -80,15 +80,21 @@
               `(and symbol-start ,@(cdr form) symbol-end))
       ;; normal identifier, for things such as variables, subs, etc..
       (identifier ,rx-identifier)
-      
+      ;; whitespace stuff
+      (ws* ,(rx (0+ (any whitespace))))
+      (ws+ ,(rx (1+ (any whitespace))))
+      (unspace ,(rx "\\" (1+ (any whitespace))))
+      (unspace? ,(rx (? "\\" (1+ (any whitespace)))))
       ;; POD6 stuff
       ;; POD6 block directives (how we will read in the block)
       (pod6-directive
        ,(rx (or "for" "para" "begin")))
-      (pod6-types
+      (pod6-type
        ,(rx (or (seq (or "head" "item") (1+ (any digit))) ;; special case: headN, itemN
-                "POD" "code" "input" "output" "item" "defn")))
-      
+                (seq (any upper) (1+ (any upper digit))) ; special case: Semantic blocks
+                "code" "input" "output" "item" "defn" "table" "comment")))
+      (pod6-formatcode
+       ,(rx (any "BCEIKLNPRTUVXZ")))
       ;; keywords that imply inclusion of code units
       (include ,(rx (or "use" "require unit")))
       ;; declarator keywords
@@ -266,6 +272,62 @@
                  (group-n 2 "d")
                  (group-n 3 (regex "[[:digit:]]") (0+ (regex "[[:digit:]_]"))))))))))
 
+(rx-let-eval raku--rx-forms
+  (defconst raku--comment-rx
+    ;; comments in raku have the following form:
+    ;;   #12
+    ;; where 1 might be some sort of twigil (`, =, |),
+    ;; where 2 might be an opener for a multiline comment
+    ;; if 1 is `
+    ;;   then expect either whitespace or a opener immediately
+    ;;   after. if any other character occurs, this is invalid
+    ;;   syntax.
+    ;; if 1 is = or |
+    ;;   then allow an opener, or a character immediately after.
+    ;;   if the character immediately after is an opener, this
+    ;;   is a multi-line comment.
+    ;;
+    ;; we should propertize everything from the # to the end
+    ;; as comment text, and as syntax-multiline
+    (rx-to-string '(seq "#"
+                        (? (group-n 1 (any "|=`")))
+                        (? (group-n 2 (syntax ?\())))))
+  (defconst raku--pod-rx
+    ;; Anatomy of a POD directive
+    ;;
+    ;; =para head1 :k(v)
+    ;;  ---^ ----^ ----^
+    ;;  Dir. Type. Params.
+    ;;
+    ;; Dir. - An optional directive (see pod6-directive)
+    ;; These directives give hints to the parser about
+    ;; where the POD directive ends.
+    ;;
+    ;; Type - A mandatory type (see pod6-type)
+    ;; This is mandatory. When a directive is not specified,
+    ;; the type must be directly adjacent to the leading '=',
+    ;; (e.g. =head1). If a directive is not specified, it is
+    ;; assumed to be `para`.
+    ;;
+    ;; Params - Optional parameters for the typesetting
+    ;; system.
+    (rx-to-string '(seq line-start ws* "="
+                        (? (group-n 1 pod6-directive) ws+) ;; optional block directive, assume para
+                        (group-n 2 pod6-type)))) ;; block type, TODO maybe include label in expr?
+  (defconst raku--pod-end-nondelim-rx
+    (rx-to-string `(or
+                    (seq line-start ws* line-end)
+                    (regex ,raku--pod-rx))))
+  (defconst raku--pod-format-rx
+    (rx-to-string '(seq (group-n 1 pod6-formatcode) "<")))
+  (defconst raku--heredoc-rx
+    ;; I'm assuming heredoc delims are restricted to syntax class _
+    ;; also, heredocs are a special class of q-string it appears
+    ;; (which would make sense)
+    (rx-to-string '(seq "q" (group-n 1 (? "q"))
+                        ":to/" (group-n 2 (syntax ?_)) "/"))))
+
+
 ;; See [[info:elisp#Syntax Class Table]]
 (defvar raku-mode-syntax-table
   (let ((table (make-syntax-table)))
@@ -298,35 +360,6 @@
           (modify-syntax-entry close (string ?\) open) table))))
     table)
   "Top-level syntax table for raku-mode.")
-
-(rx-let-eval raku--rx-forms
-  (defconst raku--comment-rx
-    ;; comments in raku have the following form:
-    ;;   #12
-    ;; where 1 might be some sort of twigil (`, =, |),
-    ;; where 2 might be an opener for a multiline comment
-    ;; if 1 is `
-    ;;   then expect either whitespace or a opener immediately
-    ;;   after. if any other character occurs, this is invalid
-    ;;   syntax.
-    ;; if 1 is = or |
-    ;;   then allow an opener, or a character immediately after.
-    ;;   if the character immediately after is an opener, this
-    ;;   is a multi-line comment.
-    ;;
-    ;; we should propertize everything from the # to the end
-    ;; as comment text, and as syntax-multiline
-    (rx-to-string '(seq "#"
-                        (? (group-n 1 (any "|=`")))
-                        (? (group-n 2 (syntax ?\())))))
-  (defconst raku--pod-rx
-    (rx-to-string '(seq )))
-  (defconst raku--heredoc-rx
-    ;; I'm assuming heredoc delims are restricted to syntax class _
-    ;; also, heredocs are a special class of q-string it appears
-    ;; (which would make sense)
-    (rx-to-string '(seq "q" (group-n 1 (? "q"))
-                        ":to/" (group-n 2 (syntax ?_)) "/"))))
 
 ;; :upside-down-smiley:
 ;;
@@ -369,13 +402,16 @@ See `rx', `rx-let', and `rx-let-eval' for more details."
 
 (defun raku--find-matching-paren (limit &optional can-escape)
   "From `point', search for balanced parens until LIMIT based on syntax table.
-`following-char' is used to determine which paren set will be scanned.
-If CAN-ESCAPE is non-nil, \\ will cause the parser to skip over one char."
+This function will move `point' either to LIMIT, or to the
+position /after/ the final paren. `following-char' is used to
+determine which paren set will be scanned. If CAN-ESCAPE is
+non-nil, \\ will cause the parser to skip over one char."
   ;; read opening char
   (let* ((opener   (following-char))
          (closer   (matching-paren opener))
-         (depth    1))
-    (if (or (zerop opener) (not closer))
+         (depth    1)
+         (found-at nil))
+    (when (or (zerop opener) (not closer))
       (error "Call to raku--find-matching paren facing char %d which has no known closer" opener))
     ;; pass first paren
     (forward-char)
@@ -394,34 +430,156 @@ If CAN-ESCAPE is non-nil, \\ will cause the parser to skip over one char."
        ;; decrease depth if we see a closer
        ((raku--looking-at-char closer)
         (setq depth (- depth 1))
+        (when (zerop depth) (setq found-at (point)))
         (forward-char)))
       ;; skip past any non parens/punctuation (we may want to catch escapes)
-      (skip-syntax-forward "^.()" limit))))
+      (skip-syntax-forward "^.()" limit))
+    ;; back up if we leveled out
+    (when found-at (goto-char found-at))))
 
 (defun raku-syntax-propertize-comment (end)
-  "Should be called looking at the beginning of a comment (#).
-Will analyze buffer until END or end of comment."
+  "Propertize a raku comment.
+Should be called looking at the comment.
+`match-data' should be match data for `raku--comment-rx'.
+Will propertize until END or end of comment."
   ;; bad hack to get match data to be consistent
   ;; wil always be redundant when called from `raku-syntax-propertize'
-  (if (looking-at raku--comment-rx)
-      (let* ((boundary (match-beginning 2))
-             (begin    (match-beginning 0)))
-        ;; go to the end of the comment
-        (save-match-data
-          (if boundary
-              (progn
-                (goto-char boundary)
-                (raku--find-matching-paren end)
-                ;; mark as a multiline construct so that
-                ;; propertize-function gets called with correct chunk
-                ;; boundaries
-                (put-text-property begin (point) 'syntax-multiline nil))
-            (end-of-line)))
-        ;; propertize the comment from beginning to point
-        (put-text-property begin (point) 'font-lock-face 'raku-comment))))
+  ;; go to the end of the comment
+  (let ((begin    (match-beginning 0))  ;; begin match
+        (twigil   (match-beginning 1))  ;; begin twigil match
+        (boundary (match-beginning 2))) ;; begin boundary match
+    (if boundary
+        (progn
+          ;; step to before boundary (e.g. |<...), and then search till matching
+          ;; balanced paren found
+          (goto-char boundary)
+          (forward-list)
+          ;;(message "bounded text: %s" (buffer-substring-no-properties boundary (point)))
+          ;; mark as a multiline construct so that
+          ;; propertize-function gets called with correct chunk
+          ;; boundaries (see `syntax-propertize-multiline')
+          (put-text-property begin (point) 'syntax-multiline t))
+      (end-of-line))
+    ;; propertize doc/embed twigil if it's here
+    (put-text-property twigil (1+ twigil) 'font-lock-face 'raku-twigil)
+    ;; propertize the comment from beginning to point
+    (put-text-property begin (point) 'font-lock-face 'raku-comment)))
 
-(defun raku-syntax-propertize-pod (end)
-  ())
+;; POD6 Parsers
+
+(defun raku--pod-find-end-delimited (type limit)
+  "Search up to LIMIT for an end directive for pod6 TYPE.
+Return non-nil if found before LIMIT."
+  (rx-let-eval raku--rx-forms
+      (let ((found  nil)
+            (end-rx (rx-to-string `(seq ws* line-start "=end" ws+ ,type))))
+        (while (and (< (point) limit) (not found))
+          (if (looking-at end-rx)
+              (progn
+                (end-of-line)
+                (setq found (point)))
+            (forward-line)))
+        found)))
+
+(defun raku--pod-find-end (limit)
+  "Search up to LIMIT for the end to an abbreviated or para pod6 block."
+  (let ((found nil))
+    (save-match-data
+      (while (and (< (point) limit) (not found))
+        (cond
+         ;; an empty line or new directive terminates this POD
+         ((looking-at raku--pod-end-nondelim-rx)
+          ;; since we're now technically looking at something that isn't the
+          ;; same POD, we need to step back to the end of the previous line,
+          ;; where the current POD ends.
+          (forward-char -1)
+          (setq found (point)))
+         ;; if none of the above, move to start of next line
+         (t (forward-line))))
+      found)))
+
+(defun raku-syntax-propertize-pod-text (limit)
+  "Propertize a region of text support pod6 control chars, bounded by LIMIT.
+Note that this function is aware of where pod text should stop,
+so you must set LIMIT wisely."
+  ;; TODO: nested format code support
+  (while (< (point) limit)
+    ;; find the next occurence of *<...
+    (when (re-search-forward raku--pod-format-rx limit t)
+      ;; the above search such place us after the format leader, e.g. `B<|`
+      (let ((text-begin (point)))
+        ;; step back to the < opening the text
+        (goto-char (1- text-begin))
+        ;; tell forward-list (great name, I know) to skip to closer
+        (forward-list)
+        ;; find-matching-paren will leave us after the closing >, e.g.
+        ;; `B<text>|` so, it would follow that (1- (point)) will be the end of
+        ;; text
+        (let* ((text-end (1- (point)))
+               (code     (match-string 1))
+               (face     (pcase code
+                           ("B" 'bold)
+                           ("I" 'italic)
+                           ("U" 'underline)
+                           ((or "L" "P") 'link)
+                           ("T" 'term)
+                           ("X" 'raku-label)
+                           ("Z" 'raku-comment)
+                           (_   'raku-string))))
+          (put-text-property text-begin text-end 'font-lock-face face))))))
+
+(defun raku-syntax-propertize-pod (match-data limit)
+  "Propertize a region of plain old documentation until LIMIT.
+MATCH-DATA should contain integer match boundaries corresponding
+to `raku--pod-rx' as per `match-data'."
+  (let* ((begin     (nth 0 match-data))
+         (dir-beg   (nth 2 match-data))
+         (dir-end   (nth 3 match-data))
+         (directive (if dir-beg
+                        (buffer-substring dir-beg dir-end)
+                      nil))
+         (typ-beg   (nth 4 match-data))
+         (typ-end   (nth 5 match-data))
+         (type      (buffer-substring typ-beg typ-end))
+         (abbrev    (null directive))
+         ;; search the end point and report it, also moves `point'
+         ;; will be nil if POD does not terminate
+         (found-end  (pcase directive
+                       ("begin" (raku--pod-find-end-delimited type limit))
+                       (_       (raku--pod-find-end limit)))))
+    ;; point is now at end of POD block (incl closing directive if applicable)
+    ;; propertize POD text depending on type
+    (save-excursion
+      ;; if this is abbreviated, text will start after typ-end
+      (if abbrev
+          (goto-char (1+ typ-end))
+        ;; otherwise, text will start on the line after the directive
+        (progn
+          ;; to get to the next line, seek back to the beginning of the pod
+          ;; directive
+          (goto-char begin)
+          ;; and then go to the next line
+          (forward-line)))
+      ;; now we are facing the start of the text. we will want to propertize up
+      ;; to either text-end or limit.
+      (let ((text-end (or found-end limit)))
+        (pcase type
+          ;; for code blocks, don't assume a format, just strip any face and
+          ;; mark as foreign so we can reason about this later (e.g. for
+          ;; indent). also apply this treatment to the DATA metatype, as it is
+          ;; conventionally used for inclusion of arbitrary data.
+          ((or "code" "DATA")
+           (raku--put-props (point) text-end `((raku-foreign ,t)
+                                               (font-lock-face ,nil))))
+          ;; treat whatever else as text
+          (_
+           (raku-syntax-propertize-pod-text text-end)))))
+    (put-text-property begin (point) 'font-lock-face 'raku-comment)
+    ;; propertize directive
+    (if dir-beg
+        (put-text-property dir-beg dir-end 'font-lock-face 'raku-declare))
+    ;; propertize type
+    (put-text-property typ-beg typ-end 'font-lock-face 'raku-type)))
 
 (defun raku-syntax-propertize (chunk-begin chunk-end)
   "`raku-mode's `syntax-propertize-function' for NQP and Raku.
@@ -431,36 +589,29 @@ Works by stepping through characters in the region until certain
 expressions are matched, at which point those expressions are
 propertized/fontified as appropriate."
   (goto-char chunk-begin)
-  ;; (message "%S" `(raku-syntax-propertize
-  ;;                 (chunk-begin ,chunk-begin)
-  ;;                 (chunk-end ,chunk-end)
-  ;;                 (point ,(point))
-  ;;                 (raku--comment-rx ,raku--comment-rx)
-  ;;                 (looking-at-comment ,(looking-at raku--comment-rx))))
+  (setq inhibit-redisplay nil)
   ;; analysis order:
   ;; 1. comments
   ;; 2. pod
-  (while (< (point) chunk-end)
-    (message "%S" `(raku-syntax-propertize
-                    (,chunk-begin ,chunk-end)
-                    (point ,(point))
-                    (following-char ,(char-to-string (following-char)))))
-    (cond
-     ;; comments, multiline comments, and documentation comments
-     ((looking-at raku--comment-rx)
-      (message "%S" `(comment-branch))
-      (raku-syntax-propertize-comment chunk-end))
-     ;; POD, POD code blocks (yikes)
-     (())
-     ;; inf. loop guard
-     (t
-      (let ((begin (point)))
-        (skip-syntax-forward " ")
-        (message "%S" `(default-branch
-                        (begin ,begin)
-                        (point ,(point))
-                        (skipped-text ,(buffer-substring begin (point)))))
-        (put-text-property begin (point) 'font-lock-face nil))))))
+  (rx-let-eval raku--rx-forms
+    (while (< (point) chunk-end)
+      (let ((start (point)))
+        (cond
+         ;; comments, multiline comments, and documentation comments
+         ((looking-at raku--comment-rx)
+          ;; TODO - do we want to modify this so that we can font-lock the twigil?
+          (raku-syntax-propertize-comment chunk-end))
+         ;; POD, POD code blocks (yikes)
+         ((looking-at raku--pod-rx)
+          (raku-syntax-propertize-pod (match-data t) chunk-end))
+         ;; inf. loop guard
+         ((looking-at "\\S-") (forward-char))
+         (t
+          (let ((begin (point)))
+            (skip-syntax-forward " ")
+            (put-text-property begin (point) 'font-lock-face nil))))
+        ;;(message "%S" `(raku-syntax-propertize-post (chunk ,(buffer-substring-no-properties start (point)))))
+        ))))
 
 (provide 'raku-syntax)
 
