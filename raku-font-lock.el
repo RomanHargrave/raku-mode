@@ -102,6 +102,19 @@
   "Face for block labels in Raku."
   :group 'raku-faces)
 
+(defface raku-pod6-default '((t :inherit font-lock-comment-face))
+  "Non-special face for POD6 regions in Raku."
+  :group 'raku-faces)
+
+(defface raku-pod6-directive '((t :inherit font-lock-keyword-face))
+  "Face for POD6 directives in Raku."
+  :group 'raku-faces)
+
+(defface raku-pod6-type '((t :inherit font-lock-constant-face))
+  "Face for POD6 types in Raku."
+  :group 'raku-faces)
+
+;; Set up regexps for different raku bits
 (eval-when-compile
   (require 'rx)
 
@@ -264,38 +277,6 @@
              (rx-to-string `(and ,@sexps) t))
             (t
              (rx-to-string (car sexps) t))))))
-
-(defconst raku-mode-syntax-table
-  (let ((table (make-syntax-table)))
-    ;; single-quoted strings
-    (modify-syntax-entry ?' "\"" table)
-    ;; these are all punctuation chars, not word or symbol chars
-    (modify-syntax-entry ?$ "." table)
-    (modify-syntax-entry ?% "." table)
-    (modify-syntax-entry ?& "." table)
-    (modify-syntax-entry ?* "." table)
-    (modify-syntax-entry ?+ "." table)
-    (modify-syntax-entry ?- "." table)
-    (modify-syntax-entry ?/ "." table)
-    (modify-syntax-entry ?< "." table)
-    (modify-syntax-entry ?= "." table)
-    (modify-syntax-entry ?> "." table)
-    (modify-syntax-entry ?| "." table)
-    table)
-  "The top level syntax table for Raku.")
-
-(defconst raku-bracket-syntax-table
-  (let ((table (make-syntax-table raku-mode-syntax-table)))
-    (modify-syntax-entry ?< "(>" table)
-    (modify-syntax-entry ?> ")<" table)
-    (modify-syntax-entry ?« "(»" table)
-    (modify-syntax-entry ?» ")«" table)
-    (modify-syntax-entry ?‘ "(’" table)
-    (modify-syntax-entry ?’ ")‘" table)
-    (modify-syntax-entry ?“ "(”" table)
-    (modify-syntax-entry ?” ")“" table)
-    table)
-  "Syntax table for bracketing constructs.")
 
 (defun raku-syntax-context (&optional state)
   "Return the syntactic context at the parse state of STATE.
@@ -461,7 +442,7 @@ OPEN-ANGLES is the opening delimiter (e.g. \"«\" or \"<<\")."
     (put-text-property beg (1+ beg) property
                        (cons context (match-data)))))
 
-(defun raku-syntax-propertize (start end)
+(defun raku-old-syntax-propertize (start end)
   "Add context-specific syntax properties to code.
 
 Takes arguments START and END which delimit the region to propertize."

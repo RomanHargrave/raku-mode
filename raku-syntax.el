@@ -674,17 +674,22 @@ code has its ~font-lock-face~ property set to DEFAULT-FACE."
       (if (re-search-forward (raku-rx pod6-format-sequence) limit t)
           ;; the above search such place us after the format leader, e.g. `B<|`
           (let ((text-begin (point)))
+            ;; fontify control opener as directive
+            (raku-put-match-props
+              ((0 ('font-lock-face . 'raku-pod6-directive))))
             ;; performance hack to avoid the need to do two passes: we
             ;; "bookmark" the beginning point of the preceding
             ;; plaintext, and then when the plaintext region
             ;; terminates, we set the desired font face for the region
             ;; spanning from that bookmark to the end of the
             ;; plaintext region.
-            (put-text-property last-plain text-begin 'font-lock-face default-face)
+            (put-text-property last-plain (match-beginning 0) 'font-lock-face default-face)
             ;; step back to the < opening the text
             (goto-char (1- text-begin))
             ;; tell forward-list (great name, I know) to skip to closer
             (forward-list)
+            ;; fontify closing brace as directive
+            (put-text-property (1- (point)) (point) 'font-lock-face 'raku-pod6-directive)
             ;; update our plaintext bookmark
             (setq last-plain (point))
             ;; forward-list will leave us after the closing >, e.g. `B<text>|` so,
