@@ -1,8 +1,10 @@
-# Raku Mode
+# Raku Mode (Rewrite Project)
 
 [![License GPL 3][badge-license]][copying]
 [![MELPA Status](http://melpa.org/packages/perl6-mode-badge.svg)](http://melpa.org/#/perl6-mode)
 [![travis][badge-travis]][travis]
+
+**Note:** This is not abandoned. I'm very busy trying to relocate right now and can't find time to work on this.
 
 Raku mode lets you edit Raku code with [GNU Emacs][] 24.
 
